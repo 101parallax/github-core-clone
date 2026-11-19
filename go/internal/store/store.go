@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -219,6 +220,15 @@ type Store struct {
 	repos     map[string]*repoState
 	repoOrder []string // repo keys in creation order
 
+	// gens maps a repo key to its mutation generation counter. The
+	// counter is allocated at CreateRepo and NEVER reset (not even by
+	// DeleteRepo), so the generation is monotonically increasing per
+	// repo key for the process lifetime: a delete+recreate cycle can
+	// never resurrect a stale cache entry keyed by generation. A
+	// sync.Map (not a plain map) keeps RepoGen's lock-free atomic load
+	// race-free against concurrent CreateRepo.
+	gens sync.Map // repo key -> *uint64
+
 	objects map[string]*gitObject // sha -> object (content-addressed, shared across repos)
 
 	nextRepoID    int64
@@ -339,6 +349,9 @@ func (s *Store) CreateRepo(owner, name string, opts RepoOptions) (*Repo, error) 
 		nextNumber: 1,
 	}
 	s.repoOrder = append(s.repoOrder, key)
+	// Allocate the generation counter, keeping an existing one: a
+	// recreated repo must not restart at generation 0 (see gens).
+	s.gens.LoadOrStore(key, new(uint64))
 	return repo, nil
 }
 
@@ -472,6 +485,7 @@ func (s *Store) GetRef(owner, name, refname string) (string, bool) {
 
 // SetRef points refname at sha, creating the ref when missing.
 // It fails with ErrRepoNotFound for an unknown repository.
+// A successful SetRef bumps the repo's generation (see RepoGen).
 func (s *Store) SetRef(owner, name, refname, sha string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -483,6 +497,7 @@ func (s *Store) SetRef(owner, name, refname, sha string) error {
 		st.refOrder = append(st.refOrder, refname)
 	}
 	st.refs[refname] = sha
+	s.bumpGenLocked(RepoKey(owner, name))
 	return nil
 }
 
@@ -505,7 +520,27 @@ func (s *Store) DeleteRef(owner, name, refname string) error {
 			break
 		}
 	}
+	s.bumpGenLocked(RepoKey(owner, name))
 	return nil
+}
+
+// RepoGen returns the repo's mutation generation (atomic load, NO
+// lock). It increments on every SetRef/DeleteRef for that repo. Cache
+// keys include the gen so stale entries are never served. Unknown
+// repos report 0.
+func (s *Store) RepoGen(owner, name string) uint64 {
+	if v, ok := s.gens.Load(RepoKey(owner, name)); ok {
+		return atomic.LoadUint64(v.(*uint64))
+	}
+	return 0
+}
+
+// bumpGenLocked increments a repo's generation counter. Caller holds
+// mu (or is otherwise the only writer); the counter itself is atomic
+// so RepoGen can read it without the lock.
+func (s *Store) bumpGenLocked(key string) {
+	v, _ := s.gens.LoadOrStore(key, new(uint64))
+	atomic.AddUint64(v.(*uint64), 1)
 }
 
 // ListRefs returns every ref of a repository in creation order.
