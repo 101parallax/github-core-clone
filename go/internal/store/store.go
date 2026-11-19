@@ -50,15 +50,15 @@ const epochSec = 1735689600
 // Errors returned by the store. Handlers map these to HTTP statuses:
 // ErrNotFound -> 404, ErrExists -> 422, ErrBadLabel -> 422.
 var (
-	ErrRepoNotFound  = errors.New("store: repository not found")
-	ErrRepoExists    = errors.New("store: repository already exists")
-	ErrIssueNotFound = errors.New("store: issue not found")
-	ErrPRNotFound    = errors.New("store: pull request not found")
-	ErrLabelExists   = errors.New("store: label already exists")
-	ErrLabelNotFound = errors.New("store: label not found")
+	ErrRepoNotFound    = errors.New("store: repository not found")
+	ErrRepoExists      = errors.New("store: repository already exists")
+	ErrIssueNotFound   = errors.New("store: issue not found")
+	ErrPRNotFound      = errors.New("store: pull request not found")
+	ErrLabelExists     = errors.New("store: label already exists")
+	ErrLabelNotFound   = errors.New("store: label not found")
 	ErrCommentNotFound = errors.New("store: comment not found")
-	ErrUserNotFound  = errors.New("store: user not found")
-	ErrRefNotFound   = errors.New("store: ref not found")
+	ErrUserNotFound    = errors.New("store: user not found")
+	ErrRefNotFound     = errors.New("store: ref not found")
 )
 
 // User is a forge user. The 12 scenario users are seeded at startup;
@@ -134,19 +134,19 @@ type Label struct {
 // Issue is a repository issue. Number shares one per-repo counter with
 // pull requests, as on GitHub: issue #1 and PR #1 can never coexist.
 type Issue struct {
-	ID         int64      `json:"id"`
-	Number     int        `json:"number"`
-	Title      string     `json:"title"`
-	Body       string     `json:"body"`
-	State      string     `json:"state"` // "open" | "closed"
-	Labels     []string   `json:"labels"`
-	Assignees  []string   `json:"assignees"`
-	UserLogin  string     `json:"user_login"`
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
-	ClosedAt   *time.Time `json:"closed_at,omitempty"`
-	Comments   []*Comment `json:"-"`
-	Seq        int64      `json:"-"`
+	ID        int64      `json:"id"`
+	Number    int        `json:"number"`
+	Title     string     `json:"title"`
+	Body      string     `json:"body"`
+	State     string     `json:"state"` // "open" | "closed"
+	Labels    []string   `json:"labels"`
+	Assignees []string   `json:"assignees"`
+	UserLogin string     `json:"user_login"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	ClosedAt  *time.Time `json:"closed_at,omitempty"`
+	Comments  []*Comment `json:"-"`
+	Seq       int64      `json:"-"`
 }
 
 // Review is a pull-request review.
@@ -1120,10 +1120,10 @@ type exportRepo struct {
 // encoding/json sorts map keys, so the bytes are stable across runs for
 // the same sequence of operations.
 type exportSnapshot struct {
-	Version int           `json:"version"`
-	Now     string        `json:"now"`
-	Users   []*User       `json:"users"`
-	Repos   []exportRepo  `json:"repos"`
+	Version int            `json:"version"`
+	Now     string         `json:"now"`
+	Users   []*User        `json:"users"`
+	Repos   []exportRepo   `json:"repos"`
 	Objects []exportObject `json:"objects"`
 }
 
