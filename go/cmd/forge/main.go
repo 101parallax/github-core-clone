@@ -5,7 +5,8 @@
 // not the contest's):
 //  1. MAKEFUN_ENV_URL names the env's origin. Without it there is nothing
 //     to talk to, so the program exits 1 at once.
-//  2. Bind an ephemeral port (127.0.0.1:0). NEVER bind 8080: the env owns it.
+//  2. Bind an ephemeral port (0.0.0.0:0 — the env dials the pod IP, not
+//     loopback). NEVER bind 8080: the env owns it.
 //  3. POST $MAKEFUN_ENV_URL/register {"port": N} with retry and exponential
 //     backoff (250ms -> 2s cap, 30s request timeout). 200 or 409 is
 //     success; 400/405 is a contract error and ends the program.
@@ -35,6 +36,7 @@ import (
 
 	"forge/internal/httpapi"
 	"forge/internal/store"
+	"forge/internal/transport"
 )
 
 // requestTimeout bounds one register or done request.
@@ -145,7 +147,7 @@ func run() error {
 	st := store.NewStore()
 	srv := httpapi.NewServer(st)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		return fmt.Errorf("listen on an ephemeral port: %w", err)
 	}
@@ -157,15 +159,15 @@ func run() error {
 	port := addr.Port
 	fmt.Fprintf(os.Stdout, "[entry] listening on port %d\n", port)
 
-	httpServer := &http.Server{Handler: srv}
+	transportServer := transport.NewServer(srv)
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- httpServer.Serve(listener)
+		serveErr <- transportServer.Serve(listener)
 	}()
 
 	// Register the bound port, then wait for the env to say done.
 	if err := register(envURL, port); err != nil {
-		_ = httpServer.Close()
+		_ = transportServer.Close()
 		return err
 	}
 	fmt.Fprintln(os.Stdout, "[entry] registered; waiting for the env to say done")
@@ -173,12 +175,10 @@ func run() error {
 	waitForDone(envURL)
 
 	// The suite is over: shut the server down and exit 0.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := httpServer.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := transportServer.Close(); err != nil {
 		return fmt.Errorf("shut down the server: %w", err)
 	}
-	<-serveErr // Serve returns ErrServerClosed after Shutdown; ignore it.
+	<-serveErr // Serve returns nil after Close; ignore it.
 	fmt.Fprintln(os.Stdout, "[entry] done")
 	return nil
 }

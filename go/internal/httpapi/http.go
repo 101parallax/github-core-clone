@@ -1,72 +1,178 @@
 // Package httpapi is the forge's HTTP surface: routing, auth, and the
-// four surfaces (git smart HTTP, REST v3, GraphQL v4, MCP).
+// four surfaces (git smart HTTP, REST v3, GraphQL v4, MCP), served
+// over the raw-TCP transport in internal/transport.
 //
-// W1's placeholder wires only the boot contract: GET /healthz answers
-// {"ok": true} without auth, everything else is a JSON 404. W3 grows
-// this package: rest.go (REST v3 dispatcher), gitproto.go (smart HTTP),
-// graphql.go and mcp.go live here, all served by Server.
+// Server implements transport.Handler. Auth is checked here, before
+// routing: every route except GET /healthz requires
+// Authorization: Bearer <MAKEFUN_SHOP_TOKEN>. The four surfaces live
+// in their own files, written by their owners (INTERFACE.md §1):
 //
-// The constructor contract main.go relies on:
+//	gitproto.go  W2  s.handleGit      smart HTTP
+//	rest.go      W3  s.handleREST     REST v3
+//	graphql.go   W4  s.handleGraphQL  GraphQL v4
+//	mcp.go       W4  s.handleMCP      MCP JSON-RPC
 //
-//	srv := httpapi.NewServer(store) // *httpapi.Server, implements http.Handler
-//
-// Server holds the store; handlers reach state only through it.
+// This file also provides the shared helpers those handlers use:
+// jsonResponse, jsonError, and requestID.
 package httpapi
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
-	"net/http"
+	"hash/fnv"
+	"os"
+	"strconv"
+	"strings"
+	"sync/atomic"
 
 	"forge/internal/store"
+	"forge/internal/transport"
 )
 
-// Server is the forge's HTTP server. It implements http.Handler.
+// Server is the forge's HTTP server: routing + auth + the four
+// surfaces. It implements transport.Handler.
 type Server struct {
 	store *store.Store
-	mux   *http.ServeMux
+	token string
+	seq   atomic.Uint64 // request-id sequence, mixed into requestID
 }
 
-// NewServer builds the server over the given store. The returned server
-// binds nothing; main.go listens on the ephemeral port and serves it.
+// NewServer builds the server over the given store. The bearer token
+// is read once, here, from env MAKEFUN_SHOP_TOKEN.
 func NewServer(s *store.Store) *Server {
-	srv := &Server{store: s, mux: http.NewServeMux()}
-	srv.routes()
-	return srv
+	return &Server{store: s, token: os.Getenv("MAKEFUN_SHOP_TOKEN")}
 }
 
-// Store returns the store this server serves. Handlers in this package
-// use srv.store directly; the accessor exists for tests and for main.go.
+// Store returns the store this server serves.
 func (s *Server) Store() *store.Store { return s.store }
 
-// routes registers the placeholder surface. W3 replaces this with the
-// full dispatcher: auth middleware, /api/v3/*, /api/graphql, /mcp and
-// /{owner}/{repo}/... git smart HTTP. /healthz stays unauthenticated.
-func (s *Server) routes() {
-	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-	})
-	// Everything else: GitHub's JSON 404, until W3's dispatcher lands.
-	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"message": "Not Found"})
-	})
-}
-
-// ServeHTTP dispatches one request.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mux.ServeHTTP(w, r)
-}
-
-// writeJSON answers with a JSON body and the GitHub JSON content type.
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	data, err := json.Marshal(body)
-	if err != nil {
-		// A body that cannot marshal is a server bug; answer 500 JSON.
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("{\"message\":\"Internal Server Error\"}\n"))
-		return
+// Handle dispatches one request. Auth is checked HERE, before routing
+// (except GET /healthz): a missing or wrong Bearer token answers 401
+// JSON {"message": "Requires authentication"}. Every response carries
+// X-GitHub-Request-Id (set here when the handler did not set it).
+func (s *Server) Handle(req *transport.Request) *transport.Response {
+	// /healthz is the ONLY unauthenticated route.
+	if req.Method == "GET" && req.Path == "/healthz" {
+		return s.withRequestID(req, jsonResponse(200, []byte(`{"ok": true}`)))
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_, _ = w.Write(append(data, '\n'))
+	if req.Header("authorization") != "Bearer "+s.token {
+		return s.withRequestID(req, jsonError(401, "Requires authentication"))
+	}
+
+	var resp *transport.Response
+	switch {
+	case req.Path == "/api/graphql":
+		resp = s.handleGraphQL(req)
+	case req.Path == "/mcp":
+		resp = s.handleMCP(req)
+	case isRESTPath(req.Path):
+		resp = s.handleREST(req)
+	case isGitPath(req.Path):
+		resp = s.handleGit(req)
+	default:
+		resp = jsonError(404, "Not Found")
+	}
+	return s.withRequestID(req, resp)
+}
+
+// withRequestID stamps X-GitHub-Request-Id on the response when the
+// handler did not, and guards against a nil response or a zero status.
+func (s *Server) withRequestID(req *transport.Request, resp *transport.Response) *transport.Response {
+	if resp == nil {
+		resp = jsonError(500, "Internal Server Error")
+	}
+	if resp.Status == 0 {
+		resp.Status = 500
+	}
+	if resp.Headers == nil {
+		resp.Headers = make(map[string]string, 1)
+	}
+	if _, ok := resp.Headers["X-GitHub-Request-Id"]; !ok {
+		resp.Headers["X-GitHub-Request-Id"] = s.requestID(req)
+	}
+	return resp
+}
+
+// isRESTPath reports whether path belongs to the REST v3 surface:
+// the /api/v3/ prefix (and the bare /api/v3), /user/, /repos/, and
+// the API root /.
+func isRESTPath(path string) bool {
+	switch {
+	case path == "/api/v3" || strings.HasPrefix(path, "/api/v3/"):
+		return true
+	case path == "/user" || strings.HasPrefix(path, "/user/"):
+		return true
+	case strings.HasPrefix(path, "/repos/"):
+		return true
+	case path == "/":
+		return true
+	}
+	return false
+}
+
+// isGitPath reports whether path is a git smart-HTTP route:
+// /{owner}/{repo}/info/refs, /{owner}/{repo}/git-upload-pack, or
+// /{owner}/{repo}/git-receive-pack. The kit's git client requests the
+// repo as /{owner}/{repo}.git (git-client.ts repoPath), so a ".git"
+// suffix on the repo segment is accepted as well; handleGit strips it
+// when it resolves the repo.
+func isGitPath(path string) bool {
+	if !strings.HasPrefix(path, "/") {
+		return false
+	}
+	rest := path[1:]
+	// Owner: the first segment, non-empty.
+	i := strings.IndexByte(rest, '/')
+	if i <= 0 {
+		return false
+	}
+	rest = rest[i+1:]
+	// Repo: the second segment, non-empty.
+	j := strings.IndexByte(rest, '/')
+	if j <= 0 {
+		return false
+	}
+	switch rest[j+1:] {
+	case "info/refs", "git-upload-pack", "git-receive-pack":
+		return true
+	}
+	return false
+}
+
+// jsonResponse builds a JSON response with the given status and body
+// bytes (already-encoded JSON, no trailing newline added). The
+// transport supplies Content-Type: application/json; charset=utf-8
+// when the response carries no Content-Type header.
+func jsonResponse(status int, body []byte) *transport.Response {
+	return &transport.Response{Status: status, Body: body}
+}
+
+// jsonError builds a JSON error response: {"message": msg}. The
+// message is JSON-escaped, so dynamic messages stay valid JSON.
+func jsonError(status int, msg string) *transport.Response {
+	quoted, _ := json.Marshal(msg) // a string always marshals
+	body := make([]byte, 0, len(quoted)+13)
+	body = append(body, `{"message":`...)
+	body = append(body, quoted...)
+	body = append(body, '}')
+	return jsonResponse(status, body)
+}
+
+// requestID returns a 16-hex-char request id for
+// X-GitHub-Request-Id. Deterministic per (method, path, seq): an
+// FNV-1a hash of the method, the path, and a per-server atomic
+// counter. No randomness, no wall clock.
+func (s *Server) requestID(req *transport.Request) string {
+	seq := s.seq.Add(1)
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(req.Method))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(req.Path))
+	_, _ = h.Write([]byte{0})
+	var tmp [8]byte
+	_, _ = h.Write(strconv.AppendUint(tmp[:0], seq, 10))
+	var sum [8]byte
+	binary.BigEndian.PutUint64(sum[:], h.Sum64())
+	return hex.EncodeToString(sum[:])
 }
